@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Årshjul og aktivitetsplan – demo v1.0</title>
+</head>
+<body style="margin:0;padding:16px;background:#eef1f4">
+<!--
+====================================================================================
+ Årshjul og aktivitetsplan for SharePoint Server SE / 2019 (Script Editor / CEWP)
+ Versjon 1.0 – 2026-11-23
+
+ Endringslogg
+   v1.0 (2026-11-23)  Første versjon.
+                      - Visninger: årshjul (lag eller side om side), kalender, liste og tidslinje (Gantt).
+                      - Tidsrom: uke, måned, kvartal og år, med bla fram/tilbake og «I dag».
+                      - Én kalender per liste, med eier og eget lag som kan slås av og på.
+                      - Rettighetsstyring: lese-/redigeringstilgang hentes per liste (EffectiveBasePermissions).
+                      - Avhengigheter: oppslagsfelt «Forgjenger» (samme liste) og tekstfeltet
+                        «ForgjengerEkstern» (format kalendernøkkel:ID, for koblinger på tvers av lister).
+                      - Demomodus med fiktive data (Fjordvik direktorat) og redigering i minnet.
+                      - SP-modus: REST + jQuery lastet fra Site Assets.
+
+ Bruk i SharePoint
+   Lim inn alt mellom <body> og </body> i en Script Editor-webdel (eller lenk filen fra en CEWP).
+   Sett AHJ_CONFIG.mode = 'sp' og tilpass jQuery-sti, listenavn og feltnavn i segment [1].
+   Krever moderne nettleser (Edge/Chrome) – koden bruker ES2017 (async/await, template literals).
+
+ Segmentoversikt
+   [1]  JS:   Konfigurasjon
+   [2]  CSS:  Tema og layout
+   [3]  HTML: Struktur
+   [4]  JS:   Dato- og hjelpefunksjoner
+   [5]  JS:   Demodata
+   [6]  JS:   Datahenting og rettigheter (SharePoint REST)
+   [7]  JS:   Tilstand og periode
+   [8]  JS:   Visning – Årshjul
+   [9]  JS:   Visning – Kalender
+   [10] JS:   Visning – Liste
+   [11] JS:   Visning – Tidslinje
+   [12] JS:   Detaljer, redigering og hendelser
+   [13] JS:   Oppstart
+====================================================================================
+-->
+
+<!-- ===== [1] JS: Konfigurasjon ===== -->
+<script>
+window.AHJ_CONFIG = {
+  mode: 'demo',                                   // 'demo' = fiktive data | 'sp' = hent fra SharePoint-lister
+  siteUrl: '',                                    // tom = gjeldende område (_spPageContextInfo.webAbsoluteUrl)
+  jqueryUrl: '/SiteAssets/lib/jquery/jquery-3.7.1.min.js', // vasket jQuery i Site Assets (brukes kun i SP-modus)
+  appTitle: 'Årshjul og aktivitetsplan',
+  orgName: 'Fjordvik direktorat (fiktiv virksomhet)',
+  yearStartMonth: 1,                              // 1 = januar. Sett f.eks. 8 for skoleår/avvikende år
+  defaultView: 'wheel',                           // 'wheel' | 'calendar' | 'list' | 'gantt'
+  defaultScale: 'year',                           // 'week' | 'month' | 'quarter' | 'year'
+  wheelMode: 'layers',                            // 'layers' = ringer i ett hjul | 'side' = ett hjul per kalender
+  showDependencies: true,
+  maxLanesPerRing: 4,                             // maks antall parallelle spor i en ring før overlapp tillates
+
+  // Interne feltnavn. Kan overstyres per kalender med calendars[n].fields
+  fields: {
+    title: 'Title',
+    start: 'Startdato',                           // Dato
+    end: 'Sluttdato',                             // Dato
+    responsible: 'Ansvarlig',                     // Person (enkel eller flere)
+    status: 'Status',                             // Valg – tom verdi = beregnes fra datoer
+    description: 'Beskrivelse',                   // Flere tekstlinjer
+    predecessors: 'Forgjenger',                   // Oppslag (flere verdier) mot samme liste
+    externalPredecessors: 'ForgjengerEkstern'     // Tekst: "okonomi:12; ikt:3" – sett '' for å slå av
+  },
+
+  calendars: [
+    { key: 'ledelse', title: 'Ledelse og styring',  listTitle: 'Årshjul Ledelse', owner: 'Direktørens stab',  color: '#2b5b84' },
+    { key: 'okonomi', title: 'Økonomi og budsjett', listTitle: 'Årshjul Økonomi', owner: 'Økonomiavdelingen', color: '#a35a10' },
+    { key: 'hr',      title: 'HR og kompetanse',    listTitle: 'Årshjul HR',      owner: 'HR-seksjonen',      color: '#6d4a99' },
+    { key: 'ikt',     title: 'IKT og sikkerhet',    listTitle: 'Årshjul IKT',     owner: 'IKT-seksjonen',     color: '#23786f' }
+  ],
+
+  // Kun demo: simulerte rettigheter per kalender ('edit' | 'read')
+  demoPermissions: { ledelse: 'edit', okonomi: 'edit', hr: 'read', ikt: 'edit' }
+};
+</script>
+
+<!-- ===== [2] CSS: Tema og layout ===== -->
+<style>
+#ahj-app{--ahj-line:#dde1e6;--ahj-text:#1d2733;--ahj-muted:#5d6b7a;--ahj-accent:#1f5f99;--ahj-today:#c62828;
+  font-family:"Segoe UI",system-ui,-apple-system,Arial,sans-serif;font-size:14px;line-height:1.4;color:var(--ahj-text);
+  background:#f6f7f9;border:1px solid var(--ahj-line);border-radius:8px;overflow:hidden}
+#ahj-app *{box-sizing:border-box}
+#ahj-app [hidden]{display:none!important}
+.ahj-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px;padding:14px 18px;background:#fff;border-bottom:1px solid var(--ahj-line)}
+.ahj-head h1{font-size:18px;margin:0;font-weight:600}
+.ahj-org{color:var(--ahj-muted)}
+.ahj-banner{margin-left:auto;font-size:12px;background:#fff4e0;color:#7a4b00;border:1px solid #f0d29a;padding:2px 9px;border-radius:12px}
+.ahj-toolbar{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;padding:10px 18px;background:#fff;border-bottom:1px solid var(--ahj-line)}
+.ahj-seg{display:inline-flex;border:1px solid var(--ahj-line);border-radius:6px;overflow:hidden}
+.ahj-seg button{border:0;background:#fff;padding:6px 12px;font:inherit;cursor:pointer;color:var(--ahj-text);border-right:1px solid var(--ahj-line)}
+.ahj-seg button:last-child{border-right:0}
+.ahj-seg button[aria-pressed="true"]{background:var(--ahj-accent);color:#fff}
+.ahj-seg button:hover:not([aria-pressed="true"]),.ahj-btn:hover{background:#eef2f6}
+.ahj-btn{border:1px solid var(--ahj-line);background:#fff;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer;color:var(--ahj-text)}
+.ahj-btn.ahj-primary{background:var(--ahj-accent);color:#fff;border-color:var(--ahj-accent)}
+.ahj-btn.ahj-primary:hover{background:#174d7e}
+.ahj-btn.ahj-danger{color:#b3261e}
+.ahj-nav{display:inline-flex;align-items:center;gap:6px}
+.ahj-period{font-weight:600;min-width:140px;text-align:center}
+.ahj-search{border:1px solid var(--ahj-line);border-radius:6px;padding:6px 10px;font:inherit;width:190px}
+.ahj-check{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+.ahj-spacer{flex:1}
+.ahj-body{display:grid;grid-template-columns:250px 1fr;min-height:600px}
+.ahj-side{background:#fff;border-right:1px solid var(--ahj-line);padding:14px}
+.ahj-side h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--ahj-muted);margin:0 0 10px}
+.ahj-layer{display:grid;grid-template-columns:auto 14px 1fr;gap:2px 8px;align-items:center;padding:8px;border-radius:6px;margin-bottom:4px;cursor:pointer}
+.ahj-layer:hover{background:#f1f4f7}
+.ahj-layer .ahj-sw{width:14px;height:14px}
+.ahj-lt{font-weight:600}
+.ahj-lm{grid-column:3;font-size:12px;color:var(--ahj-muted)}
+.ahj-layer.ahj-off .ahj-lt,.ahj-layer.ahj-off .ahj-sw{opacity:.4}
+.ahj-badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:8px;background:#e5f2e5;color:#235c23;margin-top:3px}
+.ahj-badge.ahj-ro{background:#eef0f3;color:#4a5562}
+.ahj-badge.ahj-na{background:#fdecea;color:#8a1c1c}
+.ahj-note{font-size:12px;color:var(--ahj-muted);margin-top:14px;line-height:1.5}
+.ahj-main{padding:16px;overflow:auto;min-width:0}
+.ahj-empty{padding:48px;text-align:center;color:var(--ahj-muted)}
+.ahj-sw{display:inline-block;width:12px;height:12px;border-radius:3px;flex:none;vertical-align:-1px}
+.ahj-muted{color:var(--ahj-muted)}
+/* Årshjul */
+.ahj-wheels{display:flex;flex-wrap:wrap;gap:16px;justify-content:center}
+.ahj-wheel{flex:1 1 600px;max-width:780px}
+.ahj-wheels.ahj-multi .ahj-wheel{flex:1 1 360px;max-width:520px}
+.ahj-wheel h3{text-align:center;font-size:14px;margin:0 0 6px;font-weight:600}
+.ahj-wheel svg{width:100%;height:auto;display:block}
+#ahj-app svg .ahj-act{cursor:pointer}
+#ahj-app svg .ahj-act:hover{filter:brightness(1.15)}
+#ahj-app svg .ahj-sel{stroke:#111;stroke-width:2}
+#ahj-app svg .ahj-zoom{cursor:zoom-in}
+/* Kalender */
+.ahj-months{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(480px,1fr))}
+.ahj-months.ahj-compact{grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.ahj-month{background:#fff;border:1px solid var(--ahj-line);border-radius:8px;overflow:hidden}
+.ahj-month-h{display:block;width:100%;text-align:left;border:0;background:#f1f4f7;padding:8px 10px;font:inherit;font-weight:600;cursor:zoom-in;text-transform:capitalize;color:var(--ahj-text)}
+.ahj-grid{display:grid;grid-template-columns:26px repeat(7,minmax(0,1fr))}
+.ahj-grid.ahj-grid7{grid-template-columns:repeat(7,minmax(0,1fr))}
+.ahj-wd{font-size:11px;color:var(--ahj-muted);text-align:center;padding:4px 0;border-bottom:1px solid var(--ahj-line)}
+.ahj-wk{font-size:10px;color:#9aa6b2;text-align:center;padding-top:4px;border-bottom:1px solid #eef0f3}
+.ahj-cell{min-height:86px;border-left:1px solid #eef0f3;border-bottom:1px solid #eef0f3;padding:2px 3px;min-width:0}
+.ahj-compact .ahj-cell{min-height:32px}
+.ahj-week .ahj-cell{min-height:300px}
+.ahj-cell.ahj-out{background:#fafbfc;color:#b5bec8}
+.ahj-cell.ahj-we{background:#fafafd}
+.ahj-dnum{font-size:11px;display:inline-block;min-width:18px;text-align:center;border-radius:9px}
+.ahj-cell.ahj-today .ahj-dnum{background:var(--ahj-today);color:#fff}
+.ahj-chip{display:block;font-size:11px;line-height:17px;color:#fff;border-radius:3px;padding:0 4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.ahj-chip.ahj-cont{opacity:.72}
+.ahj-strip{display:block;height:4px;border-radius:2px;margin-top:2px;cursor:pointer}
+.ahj-chip.ahj-sel,.ahj-strip.ahj-sel{outline:2px solid #111;outline-offset:1px}
+.ahj-more{font-size:10px;color:var(--ahj-muted)}
+/* Liste */
+.ahj-tablewrap{overflow-x:auto}
+.ahj-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--ahj-line)}
+.ahj-table th{text-align:left;font-size:12px;color:var(--ahj-muted);font-weight:600;padding:8px 10px;background:#f1f4f7;border-bottom:1px solid var(--ahj-line)}
+.ahj-table td{padding:7px 10px;border-bottom:1px solid #eef0f3;vertical-align:top}
+.ahj-table tr.ahj-grp td{background:#f8f9fb;font-weight:600;text-transform:capitalize}
+.ahj-table tr[data-uid]{cursor:pointer}
+.ahj-table tr[data-uid]:hover td{background:#f3f7fb}
+.ahj-table tr.ahj-sel td{background:#e6eef7}
+.ahj-st{font-size:11px;padding:1px 8px;border-radius:8px;background:#eef0f3;white-space:nowrap}
+.ahj-st-run{background:#e3effa;color:#1f5f99}
+.ahj-st-done{background:#e5f2e5;color:#235c23}
+.ahj-st-late{background:#fdecea;color:#8a1c1c}
+/* Tidslinje */
+.ahj-gantt svg{display:block;background:#fff;border:1px solid var(--ahj-line);border-radius:6px}
+/* Dialog */
+.ahj-modal{position:fixed;inset:0;background:rgba(20,28,38,.45);display:flex;align-items:center;justify-content:center;z-index:2000;padding:20px}
+.ahj-dialog{background:#fff;border-radius:10px;max-width:580px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.ahj-dlg-bar{height:6px}
+.ahj-dlg-body{padding:16px 20px}
+.ahj-dlg-body h2{margin:0 0 10px;font-size:18px}
+.ahj-dlg-body h3{font-size:13px;margin:16px 0 6px;color:var(--ahj-muted);font-weight:600}
+.ahj-dlg-body ul{list-style:none;margin:0;padding:0}
+.ahj-dl{display:grid;grid-template-columns:110px 1fr;gap:6px 12px;margin:0}
+.ahj-dl dt{color:var(--ahj-muted)}
+.ahj-dl dd{margin:0}
+.ahj-dlg-foot{display:flex;gap:8px;justify-content:flex-end;padding:12px 20px;border-top:1px solid var(--ahj-line);background:#fafbfc}
+.ahj-link{border:0;background:none;padding:3px 0;font:inherit;color:var(--ahj-accent);cursor:pointer;display:inline-flex;align-items:center;gap:6px;text-align:left}
+.ahj-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.ahj-form-grid label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--ahj-muted)}
+.ahj-form-grid .ahj-wide{grid-column:1/-1}
+.ahj-form-grid input,.ahj-form-grid select,.ahj-form-grid textarea{font:inherit;font-size:14px;color:var(--ahj-text);border:1px solid var(--ahj-line);border-radius:6px;padding:6px 8px}
+.ahj-err{color:#b3261e;font-size:13px;min-height:1em;margin:8px 0 0}
+.ahj-choose{display:flex;flex-direction:column;gap:8px}
+.ahj-choose .ahj-btn{display:flex;align-items:center;gap:8px;text-align:left}
+@media (max-width:900px){.ahj-body{grid-template-columns:1fr}.ahj-side{border-right:0;border-bottom:1px solid var(--ahj-line)}.ahj-months{grid-template-columns:1fr}}
+</style>
+
+<!-- ===== [3] HTML: Struktur ===== -->
+<div id="ahj-app">
+  <div class="ahj-head">
+    <h1 id="ahj-title"></h1><span class="ahj-org" id="ahj-org"></span>
+    <span class="ahj-banner" id="ahj-banner" hidden></span>
+  </div>
+  <div class="ahj-toolbar">
+    <div class="ahj-seg" role="group" aria-label="Visning">
+      <button type="button" data-view="wheel">Årshjul</button><button type="button" data-view="calendar">Kalender</button><button type="button" data-view="list">Liste</button><button type="button" data-view="gantt">Tidslinje</button>
+    </div>
+    <div class="ahj-seg" role="group" aria-label="Tidsrom">
+      <button type="button" data-scale="week">Uke</button><button type="button" data-scale="month">Måned</button><button type="button" data-scale="quarter">Kvartal</button><button type="button" data-scale="year">År</button>
+    </div>
+    <div class="ahj-nav">
+      <button type="button" class="ahj-btn" data-nav="-1" aria-label="Forrige periode">‹</button>
+      <span class="ahj-period" id="ahj-period" aria-live="polite"></span>
+      <button type="button" class="ahj-btn" data-nav="1" aria-label="Neste periode">›</button>
+      <button type="button" class="ahj-btn" data-nav="0">I dag</button>
+    </div>
+    <input class="ahj-search" id="ahj-search" type="search" placeholder="Søk i aktiviteter" aria-label="Søk i aktiviteter">
+    <label class="ahj-check"><input type="checkbox" id="ahj-deps"> Vis avhengigheter</label>
+    <div class="ahj-seg" role="group" aria-label="Hjulvisning" id="ahj-wheelmode">
+      <button type="button" data-wheelmode="layers">Lag</button><button type="button" data-wheelmode="side">Side om side</button>
+    </div>
+    <span class="ahj-spacer"></span>
+    <button type="button" class="ahj-btn ahj-primary" data-act="new" id="ahj-new" hidden>+ Ny aktivitet</button>
+  </div>
+  <div class="ahj-body">
+    <div class="ahj-side">
+      <h2>Kalendere</h2>
+      <div id="ahj-layers"></div>
+      <div class="ahj-note" id="ahj-note"></div>
+    </div>
+    <div class="ahj-main" id="ahj-view"></div>
+  </div>
+  <div class="ahj-modal" id="ahj-modal" hidden><div class="ahj-dialog" role="dialog" aria-modal="true" id="ahj-dialog"></div></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const C = window.AHJ_CONFIG;
+  const root = document.getElementById('ahj-app');
+  const $q = (sel) => root.querySelector(sel);
+
+  // ===== [4] JS: Dato- og hjelpefunksjoner =====
+  // Alle datoer håndteres som heltall «dagnummer» (dager siden 1970-01-01 UTC) for å unngå sommertidsfeil.
+  const DAY = 86400000;
+  const MONTHS = ['januar','februar','mars','april','mai','juni','juli','august','september','oktober','november','desember'];
+  const DAYS_S = ['ma','ti','on','to','fr','lø','sø'];
+  const DAYS_L = ['mandag','tirsdag','onsdag','torsdag','fredag','lørdag','søndag'];
+  const STATUS_CSS = { 'Pågår': 'run', 'Fullført': 'done', 'Utsatt': 'late', 'Forsinket': 'late' };
+  const dn = (y, m, d) => Math.floor(Date.UTC(y, m, d) / DAY);
+  const fromDn = (n) => new Date(n * DAY);
+  const todayDn = () => { const t = new Date(); return dn(t.getFullYear(), t.getMonth(), t.getDate()); };
+  const dow = (n) => (fromDn(n).getUTCDay() + 6) % 7;
+  const pad = (x) => (x < 10 ? '0' : '') + x;
+  const fmtShort = (n) => { const d = fromDn(n); return pad(d.getUTCDate()) + '.' + pad(d.getUTCMonth() + 1); };
+  const fmt = (n) => fmtShort(n) + '.' + fromDn(n).getUTCFullYear();
+  const fmtRange = (s, e) => s === e ? fmt(s)
+    : (fromDn(s).getUTCFullYear() === fromDn(e).getUTCFullYear() ? fmtShort(s) + '–' + fmt(e) : fmt(s) + '–' + fmt(e));
+  const dnToIso = (n) => fromDn(n).toISOString().slice(0, 10);
+  const isoToDn = (s) => { const p = s.split('-'); return dn(+p[0], +p[1] - 1, +p[2]); };
+  const spDateToDn = (v) => { if (!v) return null; const t = new Date(v); return dn(t.getFullYear(), t.getMonth(), t.getDate()); };
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  function isoWeek(n) {
+    const d = fromDn(n), day = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - day);
+    return Math.ceil(((d - Date.UTC(d.getUTCFullYear(), 0, 1)) / DAY + 1) / 7);
+  }
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const trunc = (t, n) => (t.length > n ? t.slice(0, Math.max(n - 1, 1)) + '…' : t);
+  const cal = (k) => C.calendars.find((c) => c.key === k);
+  const fieldsFor = (c) => Object.assign({}, C.fields, c.fields || {});
+  function statusOf(it) {
+    if (it.status) return it.status;
+    const t = todayDn();
+    return t > it.end ? 'Fullført' : (t >= it.start ? 'Pågår' : 'Planlagt');
+  }
+
+  // ===== [5] JS: Demodata =====
+  // Fiktiv virksomhet. Datoene legges relativt til inneværende år, slik at demoen alltid er aktuell.
+  function demoItems() {
+    const Y = new Date().getFullYear();
+    const d = (m, day, yo) => dn(Y + (yo || 0), m - 1, day);
+    const rows = [
+      // [kalender, id, tittel, start, slutt, ansvarlig, beskrivelse, forgjengere]
+      ['ledelse', 1, `Tildelingsbrev ${Y} – forankring`, d(1, 2), d(1, 16), 'Kari Nord', 'Gjennomgang av tildelingsbrevet og intern fordeling av oppdrag.', []],
+      ['ledelse', 2, `Virksomhetsplan ${Y}`, d(1, 19), d(2, 13), 'Kari Nord', 'Mål, tiltak og risiko for året fastsettes.', ['ledelse:1', 'okonomi:2']],
+      ['ledelse', 3, `Årsrapport ${Y - 1}`, d(2, 2), d(3, 13), 'Ola Fjell', 'Årsrapport til departementet med regnskap.', ['okonomi:1']],
+      ['ledelse', 4, 'Etatsstyringsmøte 1', d(4, 22), d(4, 22), 'Kari Nord', 'Styringsdialog om årsrapporten.', ['ledelse:3']],
+      ['ledelse', 5, 'Ledersamling vår', d(6, 3), d(6, 4), 'Kari Nord', '', []],
+      ['ledelse', 6, 'Strategisamling', d(8, 25), d(8, 26), 'Kari Nord', 'Prioriteringer for neste år.', []],
+      ['ledelse', 7, 'Etatsstyringsmøte 2', d(10, 28), d(10, 28), 'Kari Nord', 'Status etter andre tertial.', ['okonomi:6']],
+      ['ledelse', 8, `Risikovurdering ${Y + 1}`, d(11, 2), d(11, 27), 'Ola Fjell', 'Virksomhetsovergripende risikovurdering.', ['ledelse:6']],
+      ['ledelse', 9, `Virksomhetsplan ${Y + 1} – oppstart`, d(12, 1), d(12, 18), 'Kari Nord', '', ['okonomi:7', 'ledelse:8']],
+      ['ledelse', 10, `Tildelingsbrev ${Y + 1} – forankring`, d(1, 4, 1), d(1, 15, 1), 'Kari Nord', '', ['ledelse:9']],
+      ['okonomi', 1, `Årsregnskap ${Y - 1}`, d(1, 15), d(2, 27), 'Per Vik', 'Avslutning og avleggelse av årsregnskap.', []],
+      ['okonomi', 2, 'Intern rammefordeling', d(1, 5), d(1, 23), 'Per Vik', '', ['ledelse:1']],
+      ['okonomi', 3, `Budsjettinnspill ${Y + 1}`, d(3, 2), d(4, 15), 'Anne Lie', 'Satsingsforslag og konsekvensjusteringer.', ['ikt:8']],
+      ['okonomi', 4, 'Innspill revidert budsjett', d(4, 16), d(4, 30), 'Anne Lie', '', ['okonomi:1']],
+      ['okonomi', 5, 'Tertialrapport 1', d(5, 4), d(5, 20), 'Per Vik', '', []],
+      ['okonomi', 6, 'Tertialrapport 2', d(9, 1), d(9, 18), 'Per Vik', '', ['okonomi:5']],
+      ['okonomi', 7, `Internt budsjettforslag ${Y + 1}`, d(10, 7), d(11, 20), 'Anne Lie', '', ['okonomi:3']],
+      ['okonomi', 8, 'Prognose og omdisponering', d(11, 2), d(11, 30), 'Per Vik', '', ['okonomi:6']],
+      ['okonomi', 9, `Årsregnskap ${Y}`, d(1, 15, 1), d(2, 26, 1), 'Per Vik', '', ['okonomi:8']],
+      ['hr', 1, 'Medarbeidersamtaler', d(2, 2), d(3, 27), 'Sara Dahl', '', []],
+      ['hr', 2, 'Medarbeiderundersøkelse', d(3, 2), d(3, 20), 'Sara Dahl', '', []],
+      ['hr', 3, 'Vernerunde (HMS)', d(5, 4), d(5, 29), 'Jonas Berg', 'Oppfølging av funn fra medarbeiderundersøkelsen.', ['hr:2']],
+      ['hr', 4, 'Sommerferieavvikling', d(6, 22), d(8, 14), 'Sara Dahl', '', []],
+      ['hr', 5, 'Introduksjonsprogram nyansatte', d(9, 7), d(9, 11), 'Jonas Berg', '', []],
+      ['hr', 6, 'Lokale lønnsforhandlinger', d(9, 14), d(10, 16), 'Sara Dahl', '', []],
+      ['hr', 7, `Kompetanseplan ${Y + 1}`, d(10, 19), d(11, 27), 'Jonas Berg', '', ['ledelse:6', 'hr:1']],
+      ['ikt', 1, 'Tilgangsrevisjon', d(2, 2), d(2, 27), 'Ingrid Strand', 'Gjennomgang av tilganger i fagsystemer.', []],
+      ['ikt', 2, 'ROS-analyse IKT', d(3, 2), d(4, 30), 'Ingrid Strand', '', ['ikt:1']],
+      ['ikt', 3, 'Beredskapsøvelse', d(6, 9), d(6, 11), 'Ingrid Strand', '', ['ikt:2']],
+      ['ikt', 4, 'Endringsfrys sommer', d(7, 1), d(8, 7), 'Ingrid Strand', '', []],
+      ['ikt', 5, 'Oppgraderingsvindu SharePoint', d(8, 10), d(8, 28), 'Ingrid Strand', '', ['ikt:4']],
+      ['ikt', 6, 'Sikkerhetsmåneden', d(10, 1), d(10, 30), 'Ingrid Strand', '', []],
+      ['ikt', 7, 'Internrevisjon informasjonssikkerhet', d(11, 2), d(11, 30), 'Ingrid Strand', '', ['ikt:6', 'ikt:2']],
+      ['ikt', 8, `IKT-budsjettbehov ${Y + 1}`, d(1, 12), d(2, 20), 'Ingrid Strand', '', []]
+    ];
+    return rows.map((r) => ({ uid: r[0] + ':' + r[1], cal: r[0], id: r[1], title: r[2], start: r[3], end: r[4],
+      responsible: r[5], description: r[6], preds: r[7], status: '' }));
+  }
+
+  // ===== [6] JS: Datahenting og rettigheter (SharePoint REST) =====
+  function ensureJQuery() {
+    return new Promise((resolve, reject) => {
+      if (window.jQuery) return resolve(window.jQuery);
+      const s = document.createElement('script');
+      s.src = C.jqueryUrl;
+      s.onload = () => resolve(window.jQuery);
+      s.onerror = () => reject(new Error('Fant ikke jQuery på ' + C.jqueryUrl));
+      document.head.appendChild(s);
+    });
+  }
+  const webUrl = () => C.siteUrl || (window._spPageContextInfo && window._spPageContextInfo.webAbsoluteUrl) || '';
+  function spGet(url) {
+    return new Promise((resolve, reject) => {
+      window.jQuery.ajax({ url, method: 'GET', headers: { Accept: 'application/json;odata=verbose' } })
+        .done((r) => resolve(r.d))
+        .fail((x) => reject(new Error(x.status === 401 || x.status === 403 ? 'Ingen tilgang'
+          : x.status === 404 ? 'Fant ikke listen' : 'Feil ' + x.status)));
+    });
+  }
+  async function loadCalendarSP(c) {
+    const L = S.layers[c.key], f = fieldsFor(c);
+    const base = `${webUrl()}/_api/web/lists/getbytitle('${encodeURIComponent(c.listTitle.replace(/'/g, "''"))}')`;
+    try {
+      // Rettigheter: ViewListItems = 0x1, AddListItems = 0x2, EditListItems = 0x4 (Low-delen av masken)
+      const meta = await spGet(base + '?$select=Title,EffectiveBasePermissions,DefaultNewFormUrl,DefaultEditFormUrl,DefaultDisplayFormUrl');
+      const low = parseInt(meta.EffectiveBasePermissions.Low, 10);
+      Object.assign(L, { available: true, error: null, canAdd: (low & 0x2) !== 0, canEdit: (low & 0x4) !== 0,
+        forms: { new: meta.DefaultNewFormUrl, edit: meta.DefaultEditFormUrl, disp: meta.DefaultDisplayFormUrl } });
+
+      const sel = ['Id', f.title, f.start, f.end], exp = [];
+      if (f.status) sel.push(f.status);
+      if (f.description) sel.push(f.description);
+      if (f.externalPredecessors) sel.push(f.externalPredecessors);
+      if (f.responsible) { sel.push(f.responsible + '/Title'); exp.push(f.responsible); }
+      if (f.predecessors) { sel.push(f.predecessors + '/Id'); exp.push(f.predecessors); }
+      let url = `${base}/items?$select=${sel.join(',')}${exp.length ? '&$expand=' + exp.join(',') : ''}&$top=5000`;
+      let rows = [];
+      while (url) { const d = await spGet(url); rows = rows.concat(d.results); url = d.__next || null; }
+
+      return rows.map((r) => {
+        const s = spDateToDn(r[f.start]);
+        let e = spDateToDn(r[f.end]);
+        if (e == null || e < s) e = s;
+        let resp = '';
+        if (f.responsible && r[f.responsible]) {
+          const v = r[f.responsible];
+          resp = v.results ? v.results.map((x) => x.Title).join(', ') : (v.Title || '');
+        }
+        let preds = [];
+        if (f.predecessors && r[f.predecessors]) {
+          const v = r[f.predecessors];
+          preds = (v.results ? v.results : [v]).filter((x) => x && x.Id).map((x) => c.key + ':' + x.Id);
+        }
+        if (f.externalPredecessors && r[f.externalPredecessors]) {
+          preds = preds.concat(String(r[f.externalPredecessors]).split(/[;,\s]+/).filter((x) => x.indexOf(':') > 0));
+        }
+        return { uid: c.key + ':' + r.Id, cal: c.key, id: r.Id, title: r[f.title] || '(uten tittel)', start: s, end: e,
+          responsible: resp, status: f.status ? (r[f.status] || '') : '', preds,
+          description: f.description ? String(r[f.description] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '' };
+      }).filter((it) => it.start != null);
+    } catch (err) {
+      Object.assign(L, { available: false, canAdd: false, canEdit: false, error: err.message });
+      return [];
+    }
+  }
+  function openSpForm(kind, key, id) {
+    let url = S.layers[key].forms[kind];
+    if (!url) return;
+    if (id) url += (url.indexOf('?') < 0 ? '?' : '&') + 'ID=' + id;
+    const opts = { url, title: cal(key).title, dialogReturnValueCallback: (r) => { if (r === 1) load(); } };
+    if (window.SP && SP.SOD) SP.SOD.execute('sp.ui.dialog.js', 'SP.UI.ModalDialog.showModalDialog', opts);
+    else window.location.href = url + '&Source=' + encodeURIComponent(window.location.href);
+  }
+
+  // ===== [7] JS: Tilstand og periode =====
+  const S = { view: C.defaultView, scale: C.defaultScale, anchor: todayDn(), wheelMode: C.wheelMode,
+    showDeps: C.showDependencies, search: '', layers: {}, items: [], byUid: {}, selected: null, loading: true, error: null };
+  C.calendars.forEach((c) => { S.layers[c.key] = { visible: true, available: true, canEdit: false, canAdd: false, error: null, forms: {} }; });
+
+  function period() {
+    const a = fromDn(S.anchor), y = a.getUTCFullYear(), m = a.getUTCMonth();
+    let p0, p1, label;
+    if (S.scale === 'year') {
+      const sm = (C.yearStartMonth || 1) - 1, ys = m >= sm ? y : y - 1;
+      p0 = dn(ys, sm, 1); p1 = dn(ys + 1, sm, 1);
+      label = sm === 0 ? String(ys) : ys + '/' + String(ys + 1).slice(2);
+    } else if (S.scale === 'quarter') {
+      const q = Math.floor(m / 3);
+      p0 = dn(y, q * 3, 1); p1 = dn(y, q * 3 + 3, 1); label = `${q + 1}. kvartal ${y}`;
+    } else if (S.scale === 'month') {
+      p0 = dn(y, m, 1); p1 = dn(y, m + 1, 1); label = cap(MONTHS[m]) + ' ' + y;
+    } else {
+      p0 = S.anchor - dow(S.anchor); p1 = p0 + 7; label = `Uke ${isoWeek(p0)} ${fromDn(p0 + 3).getUTCFullYear()}`;
+    }
+    return { p0, p1, label };
+  }
+  function shift(dir) {
+    const a = fromDn(S.anchor), k = { year: 12, quarter: 3, month: 1 }[S.scale];
+    if (k) S.anchor = dn(a.getUTCFullYear(), a.getUTCMonth() + dir * k, 1);
+    else S.anchor += 7 * dir;
+  }
+  // Inndeling av perioden i hovedenheter (ytre ring/akse) og underenheter
+  function units(p) {
+    const major = [], minor = [];
+    const months = (arr, f) => { let s = p.p0; while (s < p.p1) { const d = fromDn(s); const e = Math.min(dn(d.getUTCFullYear(), d.getUTCMonth() + 1, 1), p.p1); arr.push({ s, e, label: f(d) }); s = e; } };
+    const weeks = (arr, f) => { let s = p.p0; while (s < p.p1) { const e = Math.min(s + 7 - dow(s), p.p1); arr.push({ s, e, label: f(s) }); s = e; } };
+    const days = (arr, f) => { for (let s = p.p0; s < p.p1; s++) arr.push({ s, e: s + 1, label: f(s) }); };
+    if (S.scale === 'year') { months(major, (d) => MONTHS[d.getUTCMonth()]); weeks(minor, (s) => String(isoWeek(s))); }
+    else if (S.scale === 'quarter') { months(major, (d) => MONTHS[d.getUTCMonth()]); weeks(minor, (s) => 'uke ' + isoWeek(s)); }
+    else if (S.scale === 'month') { weeks(major, (s) => 'Uke ' + isoWeek(s)); days(minor, (s) => String(fromDn(s).getUTCDate())); }
+    else { days(major, (s) => DAYS_L[dow(s)]); days(minor, (s) => fmtShort(s)); }
+    return { major, minor };
+  }
+  const visibleKeys = () => C.calendars.filter((c) => S.layers[c.key].visible && S.layers[c.key].available).map((c) => c.key);
+  function visibleItems(p) {
+    const q = S.search.trim().toLowerCase();
+    return S.items.filter((it) => {
+      const L = S.layers[it.cal];
+      return L && L.visible && L.available && it.start < p.p1 && it.end + 1 > p.p0 &&
+        (!q || (it.title + ' ' + (it.responsible || '') + ' ' + (it.description || '')).toLowerCase().includes(q));
+    });
+  }
+  function buildIndex() {
+    S.byUid = {};
+    S.items.forEach((it) => { S.byUid[it.uid] = it; it.succs = []; });
+    S.items.forEach((it) => {
+      it.preds = (it.preds || []).filter((u) => S.byUid[u] && u !== it.uid);
+      it.preds.forEach((u) => S.byUid[u].succs.push(it.uid));
+    });
+  }
+  function assignLanes(its) {
+    const max = C.maxLanesPerRing || 4, ends = [];
+    its.slice().sort((a, b) => a.start - b.start || b.end - a.end).forEach((it) => {
+      let l = ends.findIndex((e) => e <= it.start);
+      if (l < 0) { if (ends.length < max) { l = ends.length; ends.push(0); } else l = ends.indexOf(Math.min(...ends)); }
+      ends[l] = it.end + 1; it._lane = l;
+    });
+    return Math.max(ends.length, 1);
+  }
+
+  function render() {
+    const p = period();
+    root.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.view === S.view));
+    root.querySelectorAll('[data-scale]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.scale === S.scale));
+    root.querySelectorAll('[data-wheelmode]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.wheelmode === S.wheelMode));
+    $q('#ahj-wheelmode').hidden = S.view !== 'wheel';
+    $q('#ahj-period').textContent = p.label;
+    $q('#ahj-deps').checked = S.showDeps;
+    $q('#ahj-new').hidden = !C.calendars.some((c) => S.layers[c.key].canAdd && S.layers[c.key].available);
+    renderLayers();
+    const v = $q('#ahj-view');
+    if (S.loading) { v.innerHTML = '<div class="ahj-empty">Laster aktiviteter …</div>'; return; }
+    if (S.error) { v.innerHTML = `<div class="ahj-empty">Kunne ikke laste data: ${esc(S.error)}</div>`; return; }
+    if (!visibleKeys().length) { v.innerHTML = '<div class="ahj-empty">Ingen kalendere er valgt.</div>'; return; }
+    ({ wheel: renderWheel, calendar: renderCalendar, list: renderList, gantt: renderGantt }[S.view] || renderWheel)(v, p);
+  }
+  function renderLayers() {
+    $q('#ahj-layers').innerHTML = C.calendars.map((c) => {
+      const L = S.layers[c.key], n = S.items.filter((i) => i.cal === c.key).length;
+      const badge = !L.available ? `<span class="ahj-badge ahj-na">${esc(L.error || 'Utilgjengelig')}</span>`
+        : L.canEdit ? '<span class="ahj-badge">Kan redigere</span>' : '<span class="ahj-badge ahj-ro">Lesetilgang</span>';
+      return `<label class="ahj-layer${L.visible && L.available ? '' : ' ahj-off'}">
+        <input type="checkbox" data-layer="${c.key}"${L.visible ? ' checked' : ''}${L.available ? '' : ' disabled'}>
+        <span class="ahj-sw" style="background:${c.color}"></span><span class="ahj-lt">${esc(c.title)}</span>
+        <span class="ahj-lm">Eier: ${esc(c.owner || '–')} · ${n} aktiviteter<br>${badge}</span></label>`;
+    }).join('');
+    $q('#ahj-note').textContent = C.mode === 'demo'
+      ? 'Demo: HR-kalenderen er satt til lesetilgang for å vise rettighetsstyring. Klikk på en aktivitet for detaljer og avhengigheter, eller på en måned for å zoome inn.'
+      : 'Lese- og redigeringstilgang hentes fra hver liste. Kalendere du ikke har tilgang til vises som utilgjengelige.';
+  }
+
+  // ===== [8] JS: Visning – Årshjul =====
+  let uidc = 0;
+  const markers = (id) => ['', 'h'].map((h) => `<marker id="ahjA${id}${h}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="${h ? '#111' : '#55606c'}"/></marker>`).join('');
+
+  function renderWheel(el, p) {
+    const keys = visibleKeys(), items = visibleItems(p);
+    if (S.wheelMode === 'side' && keys.length > 1) {
+      el.innerHTML = '<div class="ahj-wheels ahj-multi">' + keys.map((k) => {
+        const c = cal(k);
+        return `<div class="ahj-wheel"><h3><span class="ahj-sw" style="background:${c.color}"></span> ${esc(c.title)} <span class="ahj-muted" style="font-weight:400">· ${esc(c.owner)}</span></h3>${wheelSvg(p, [k], items.filter((i) => i.cal === k))}</div>`;
+      }).join('') + '</div>';
+    } else {
+      el.innerHTML = `<div class="ahj-wheels"><div class="ahj-wheel">${wheelSvg(p, keys, items)}</div></div>`;
+    }
+  }
+
+  function wheelSvg(p, keys, items) {
+    const c = 350, R_MO = 346, R_MI = 318, R_NI = 300, R_LO = 294, R_H = 96, TAU = 2 * Math.PI;
+    const span = p.p1 - p.p0;
+    const ang = (t) => -Math.PI / 2 + TAU * (t - p.p0) / span;
+    const xy = (r, a) => [c + r * Math.cos(a), c + r * Math.sin(a)];
+    const pt = (r, a) => xy(r, a).map((v) => v.toFixed(2)).join(',');
+    const sector = (r0, r1, a0, a1) => {
+      if (a1 - a0 > TAU - 0.003) a1 = a0 + TAU - 0.003;
+      const L = a1 - a0 > Math.PI ? 1 : 0;
+      return `M${pt(r1, a0)} A${r1},${r1} 0 ${L} 1 ${pt(r1, a1)} L${pt(r0, a1)} A${r0},${r0} 0 ${L} 0 ${pt(r0, a0)} Z`;
+    };
+    // Tekst langs bue – snus på nedre halvdel slik at den alltid leses fra venstre mot høyre
+    const arcText = (txt, r, a0, a1, fs, attrs) => {
+      if (a1 - a0 > TAU - 0.01) a1 = a0 + TAU - 0.01;
+      const maxC = Math.floor(r * (a1 - a0) / (fs * 0.6)) - 1;
+      if (maxC < 2) return '';
+      const mid = (a0 + a1) / 2, nm = ((mid % TAU) + TAU) % TAU, bottom = nm > 0.05 && nm < Math.PI - 0.05;
+      const big = a1 - a0 > Math.PI ? 1 : 0, pid = 'ahjtp' + (++uidc);
+      const d = bottom ? `M${pt(r, a1)} A${r},${r} 0 ${big} 0 ${pt(r, a0)}` : `M${pt(r, a0)} A${r},${r} 0 ${big} 1 ${pt(r, a1)}`;
+      return `<path id="${pid}" d="${d}" fill="none"/><text font-size="${fs}" ${attrs} dy="${(fs * 0.35).toFixed(1)}" pointer-events="none"><textPath href="#${pid}" xlink:href="#${pid}" startOffset="50%" text-anchor="middle">${esc(trunc(String(txt), maxC))}</textPath></text>`;
+    };
+    const id = ++uidc, u = units(p), o = [];
+    o.push(`<svg viewBox="0 0 700 700" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" role="img" aria-label="Årshjul ${esc(p.label)}"><defs>${markers(id)}</defs>`);
+
+    // Hovedenheter (ytterste ring) – klikk zoomer til måned
+    const zoomable = S.scale === 'year' || S.scale === 'quarter';
+    u.major.forEach((m, i) => {
+      const a0 = ang(m.s), a1 = ang(m.e);
+      o.push(`<path d="${sector(R_MI, R_MO, a0, a1)}" fill="${i % 2 ? '#e9eef3' : '#dde4ec'}" stroke="#fff" stroke-width="1.5"${zoomable ? ` class="ahj-zoom" data-month="${m.s}"` : ''}><title>${esc(cap(m.label))}${zoomable ? ' – klikk for å zoome' : ''}</title></path>`);
+      o.push(arcText(cap(m.label), (R_MI + R_MO) / 2, a0, a1, 13, 'font-weight="600" fill="#33414f"'));
+    });
+    // Underenheter
+    u.minor.forEach((m, i) => {
+      const a0 = ang(m.s), a1 = ang(m.e);
+      o.push(`<path d="${sector(R_NI, R_MI, a0, a1)}" fill="${i % 2 ? '#f6f8fa' : '#fff'}" stroke="#e3e7ec" stroke-width=".6"/>`);
+      o.push(arcText(m.label, (R_NI + R_MI) / 2, a0, a1, 9, 'fill="#6b7886"'));
+    });
+    // Ringbakgrunn per kalender
+    const ringH = (R_LO - R_H) / Math.max(keys.length, 1), pos = {};
+    keys.forEach((k, idx) => {
+      const r1 = R_LO - idx * ringH, r0 = r1 - ringH + 3;
+      o.push(`<circle cx="${c}" cy="${c}" r="${((r0 + r1) / 2).toFixed(1)}" fill="none" stroke="${cal(k).color}" stroke-opacity=".09" stroke-width="${(r1 - r0).toFixed(1)}"/>`);
+    });
+    u.major.forEach((m) => { const a = xy(R_H, ang(m.s)), b = xy(R_LO, ang(m.s)); o.push(`<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#c4ccd6" stroke-width=".8"/>`); });
+
+    // Aktiviteter som buer, fordelt i spor innen ringen
+    keys.forEach((k, idx) => {
+      const r1 = R_LO - idx * ringH, r0 = r1 - ringH + 3, col = cal(k).color;
+      const its = items.filter((i) => i.cal === k), lanes = assignLanes(its), lh = (r1 - r0) / lanes;
+      its.forEach((it) => {
+        const lr1 = r1 - it._lane * lh - 0.8, lr0 = lr1 - lh + 1.6;
+        let a0 = ang(Math.max(it.start, p.p0)), a1 = ang(Math.min(it.end + 1, p.p1));
+        if (a1 - a0 < 0.014) { const mid = (a0 + a1) / 2; a0 = mid - 0.007; a1 = mid + 0.007; }
+        o.push(`<path class="ahj-act${S.selected === it.uid ? ' ahj-sel' : ''}" data-uid="${it.uid}" d="${sector(lr0, lr1, a0, a1)}" fill="${col}"><title>${esc(it.title)} – ${fmtRange(it.start, it.end)}</title></path>`);
+        const fs = Math.min(11, Math.max(7, (lr1 - lr0) * 0.5));
+        if (lr1 - lr0 >= 11) o.push(arcText(it.title, (lr0 + lr1) / 2, a0, a1, +fs.toFixed(1), 'fill="#fff" font-weight="500"'));
+        pos[it.uid] = { a0, a1, r: (lr0 + lr1) / 2 };
+      });
+    });
+
+    // Avhengigheter: fra slutten av forgjenger til starten av etterfølger, buet inn mot sentrum
+    if (S.showDeps) items.forEach((it) => it.preds.forEach((pu) => {
+      const A = pos[pu], B = pos[it.uid];
+      if (!A || !B) return;
+      const q1 = xy(A.r, A.a1), q2 = xy(B.r, B.a0);
+      const cx = c + ((q1[0] + q2[0]) / 2 - c) * 0.45, cy = c + ((q1[1] + q2[1]) / 2 - c) * 0.45;
+      const hl = S.selected && (S.selected === pu || S.selected === it.uid);
+      o.push(`<path d="M${q1[0].toFixed(1)},${q1[1].toFixed(1)} Q${cx.toFixed(1)},${cy.toFixed(1)} ${q2[0].toFixed(1)},${q2[1].toFixed(1)}" fill="none" stroke="${hl ? '#111' : '#55606c'}" stroke-width="${hl ? 2 : 1.1}"${hl ? '' : ' stroke-dasharray="4 3" stroke-opacity=".7"'} marker-end="url(#ahjA${id}${hl ? 'h' : ''})" pointer-events="none"/>`);
+    }));
+
+    // I dag-markør og sentrum
+    const t = todayDn(), inP = t >= p.p0 && t < p.p1;
+    if (inP) { const a = xy(R_H - 4, ang(t + 0.5)), b = xy(R_MO, ang(t + 0.5)); o.push(`<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#c62828" stroke-width="2" pointer-events="none"/>`); }
+    o.push(`<circle cx="${c}" cy="${c}" r="${R_H - 6}" fill="#fff" stroke="#dde1e6"/>`);
+    o.push(`<text x="${c}" y="${c - 6}" text-anchor="middle" font-size="${p.label.length > 10 ? 18 : 26}" font-weight="700" fill="#1d2733">${esc(p.label)}</text>`);
+    o.push(`<text x="${c}" y="${c + 16}" text-anchor="middle" font-size="11" fill="#5d6b7a">${fmt(p.p0)} – ${fmt(p.p1 - 1)}</text>`);
+    if (inP) o.push(`<text x="${c}" y="${c + 34}" text-anchor="middle" font-size="11" font-weight="600" fill="#c62828">I dag ${fmtShort(t)}</text>`);
+    o.push('</svg>');
+    return o.join('');
+  }
+
+  // ===== [9] JS: Visning – Kalender =====
+  function renderCalendar(el, p) {
+    const items = visibleItems(p), t0 = todayDn();
+    const dayItems = (d) => items.filter((i) => i.start <= d && i.end >= d)
+      .sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+    const cell = (d, inMonth, compact, big) => {
+      const cls = ['ahj-cell'];
+      if (!inMonth) cls.push('ahj-out'); else if (dow(d) >= 5) cls.push('ahj-we');
+      if (d === t0) cls.push('ahj-today');
+      let inner = `<span class="ahj-dnum">${fromDn(d).getUTCDate()}</span>`;
+      if (inMonth) {
+        const its = dayItems(d), lim = compact ? 3 : (big ? 14 : 4);
+        its.slice(0, lim).forEach((it) => {
+          const col = cal(it.cal).color, sel = S.selected === it.uid ? ' ahj-sel' : '';
+          if (compact) inner += `<span class="ahj-strip${sel}" data-uid="${it.uid}" style="background:${col}" title="${esc(it.title)}"></span>`;
+          else {
+            const first = big || d === it.start || dow(d) === 0 || fromDn(d).getUTCDate() === 1;
+            inner += `<span class="ahj-chip${first ? '' : ' ahj-cont'}${sel}" data-uid="${it.uid}" style="background:${col}" title="${esc(it.title)} – ${fmtRange(it.start, it.end)}">${first ? esc(it.title) : '&nbsp;'}</span>`;
+          }
+        });
+        if (its.length > lim) inner += `<span class="ahj-more">+${its.length - lim} til</span>`;
+      }
+      return `<div class="${cls.join(' ')}">${inner}</div>`;
+    };
+    if (S.scale === 'week') {
+      let h = '';
+      for (let d = p.p0; d < p.p1; d++) h += `<div class="ahj-wd">${DAYS_L[dow(d)]} ${fmtShort(d)}</div>`;
+      for (let d = p.p0; d < p.p1; d++) h += cell(d, true, false, true);
+      el.innerHTML = `<div class="ahj-month ahj-week"><div class="ahj-grid ahj-grid7">${h}</div></div>`;
+      return;
+    }
+    const list = [];
+    for (let s = p.p0; s < p.p1;) { const d = fromDn(s); list.push([d.getUTCFullYear(), d.getUTCMonth()]); s = dn(d.getUTCFullYear(), d.getUTCMonth() + 1, 1); }
+    const compact = list.length > 3;
+    el.innerHTML = `<div class="ahj-months${compact ? ' ahj-compact' : ''}">` + list.map(([y, m]) => {
+      const first = dn(y, m, 1), last = dn(y, m + 1, 1) - 1, gs = first - dow(first), ge = last + (6 - dow(last));
+      let h = '<div class="ahj-wd">U</div>' + DAYS_S.map((x) => `<div class="ahj-wd">${x}</div>`).join('');
+      for (let w = gs; w <= ge; w += 7) {
+        h += `<div class="ahj-wk">${isoWeek(w)}</div>`;
+        for (let i = 0; i < 7; i++) h += cell(w + i, w + i >= first && w + i <= last, compact, false);
+      }
+      const zoom = S.scale !== 'month';
+      return `<div class="ahj-month"><button type="button" class="ahj-month-h"${zoom ? ` data-month="${first}" title="Vis måned"` : ' style="cursor:default"'}>${MONTHS[m]} ${y}</button><div class="ahj-grid">${h}</div></div>`;
+    }).join('') + '</div>';
+  }
+
+  // ===== [10] JS: Visning – Liste =====
+  function renderList(el, p) {
+    const items = visibleItems(p).sort((a, b) => a.start - b.start || a.end - b.end);
+    if (!items.length) { el.innerHTML = '<div class="ahj-empty">Ingen aktiviteter i perioden.</div>'; return; }
+    let cur = '';
+    const tr = [];
+    items.forEach((it) => {
+      const g = fromDn(Math.max(it.start, p.p0)), key = MONTHS[g.getUTCMonth()] + ' ' + g.getUTCFullYear();
+      if (key !== cur) { cur = key; tr.push(`<tr class="ahj-grp"><td colspan="7">${key}</td></tr>`); }
+      const c = cal(it.cal), st = statusOf(it), dur = it.end - it.start + 1;
+      tr.push(`<tr data-uid="${it.uid}"${S.selected === it.uid ? ' class="ahj-sel"' : ''}>
+        <td><span class="ahj-sw" style="background:${c.color}"></span> ${esc(it.title)}</td><td>${esc(c.title)}</td>
+        <td style="white-space:nowrap">${fmtRange(it.start, it.end)}</td><td>${dur}</td><td>${esc(it.responsible || '–')}</td>
+        <td><span class="ahj-st ahj-st-${STATUS_CSS[st] || 'plan'}">${esc(st)}</span></td>
+        <td>${esc(it.preds.map((u) => S.byUid[u].title).join(', ')) || '–'}</td></tr>`);
+    });
+    el.innerHTML = `<div class="ahj-tablewrap"><table class="ahj-table"><thead><tr><th>Aktivitet</th><th>Kalender</th><th>Periode</th><th>Dager</th><th>Ansvarlig</th><th>Status</th><th>Avhenger av</th></tr></thead><tbody>${tr.join('')}</tbody></table></div>`;
+  }
+
+  // ===== [11] JS: Visning – Tidslinje =====
+  function renderGantt(el, p) {
+    const W = Math.max(el.clientWidth - 34, 760), LW = 240, RH = 26, GH = 28, HH = 50, PR = 12;
+    const span = p.p1 - p.p0, X = (t) => LW + (t - p.p0) / span * (W - LW - PR);
+    const items = visibleItems(p), rows = [];
+    visibleKeys().forEach((k) => {
+      const its = items.filter((i) => i.cal === k).sort((a, b) => a.start - b.start || a.end - b.end);
+      if (!its.length) return;
+      rows.push({ g: k });
+      its.forEach((it) => rows.push({ it }));
+    });
+    if (!rows.length) { el.innerHTML = '<div class="ahj-empty">Ingen aktiviteter i perioden.</div>'; return; }
+    let y = HH;
+    const pos = {};
+    rows.forEach((r) => { r.y = y; y += r.g ? GH : RH; });
+    const H = y + 6, u = units(p), id = ++uidc, o = [];
+    o.push(`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tidslinje ${esc(p.label)}"><defs>${markers(id)}</defs>`);
+    if (S.scale === 'month' || S.scale === 'week') for (let t = p.p0; t < p.p1; t++) if (dow(t) >= 5) o.push(`<rect x="${X(t)}" y="${HH}" width="${X(t + 1) - X(t)}" height="${H - HH}" fill="#f5f6f9"/>`);
+    rows.forEach((r, i) => {
+      if (r.g) {
+        const c = cal(r.g);
+        o.push(`<rect x="0" y="${r.y}" width="${W}" height="${GH}" fill="${c.color}" fill-opacity=".1"/><text x="10" y="${r.y + GH / 2}" dy=".35em" font-size="12" font-weight="600" fill="${c.color}">${esc(c.title)} <tspan fill="#5d6b7a" font-weight="400">· ${esc(c.owner)}</tspan></text>`);
+      } else if (i % 2) o.push(`<rect x="0" y="${r.y}" width="${LW}" height="${RH}" fill="#fafbfc"/>`);
+    });
+    u.major.forEach((m, i) => {
+      const x0 = X(m.s), x1 = X(m.e), z = S.scale === 'year' || S.scale === 'quarter';
+      o.push(`<rect x="${x0}" y="0" width="${x1 - x0}" height="24" fill="${i % 2 ? '#e9eef3' : '#dde4ec'}"${z ? ` class="ahj-zoom" data-month="${m.s}"` : ''}/>`);
+      if (x1 - x0 > m.label.length * 6.8) o.push(`<text x="${(x0 + x1) / 2}" y="12" dy=".35em" text-anchor="middle" font-size="12" font-weight="600" fill="#33414f" pointer-events="none">${esc(cap(m.label))}</text>`);
+      else if (x1 - x0 > 26) o.push(`<text x="${(x0 + x1) / 2}" y="12" dy=".35em" text-anchor="middle" font-size="11" font-weight="600" fill="#33414f" pointer-events="none">${esc(cap(m.label.slice(0, 3)))}</text>`);
+      o.push(`<line x1="${x0}" x2="${x0}" y1="0" y2="${H}" stroke="#c4ccd6" stroke-width=".8"/>`);
+    });
+    u.minor.forEach((m) => {
+      const x0 = X(m.s), x1 = X(m.e);
+      o.push(`<line x1="${x0}" x2="${x0}" y1="24" y2="${H}" stroke="#eef0f3"/>`);
+      if (x1 - x0 > m.label.length * 5.6 + 2) o.push(`<text x="${(x0 + x1) / 2}" y="37" dy=".35em" text-anchor="middle" font-size="10" fill="#6b7886">${esc(m.label)}</text>`);
+    });
+    o.push(`<rect x="0" y="0" width="${LW}" height="${HH}" fill="#fff"/><text x="12" y="${HH / 2}" dy=".35em" font-size="12" font-weight="600" fill="#5d6b7a">Aktivitet</text>`);
+    o.push(`<line x1="0" x2="${W}" y1="${HH}" y2="${HH}" stroke="#dde1e6"/><line x1="${LW}" x2="${LW}" y1="0" y2="${H}" stroke="#dde1e6"/>`);
+
+    rows.forEach((r) => {
+      if (!r.it) return;
+      const it = r.it, col = cal(it.cal).color, yc = r.y + RH / 2, sel = S.selected === it.uid ? ' ahj-sel' : '';
+      const tip = `<title>${esc(it.title)} – ${fmtRange(it.start, it.end)}</title>`;
+      o.push(`<circle cx="14" cy="${yc}" r="4" fill="${col}"/><text class="ahj-act" data-uid="${it.uid}" x="24" y="${yc}" dy=".35em" font-size="12" fill="#1d2733"${S.selected === it.uid ? ' font-weight="700"' : ''}>${esc(trunc(it.title, 32))}${tip}</text>`);
+      if (it.start === it.end) {
+        const xm = X(it.start + 0.5);
+        o.push(`<path class="ahj-act${sel}" data-uid="${it.uid}" d="M${xm},${yc - 8}L${xm + 8},${yc}L${xm},${yc + 8}L${xm - 8},${yc}Z" fill="${col}">${tip}</path>`);
+        o.push(`<text x="${xm + 12}" y="${yc}" dy=".35em" font-size="11" fill="#5d6b7a" pointer-events="none">${fmtShort(it.start)}</text>`);
+        pos[it.uid] = { xs: xm - 8, xe: xm + 8, y: yc };
+      } else {
+        const x0 = X(Math.max(it.start, p.p0)), x1 = X(Math.min(it.end + 1, p.p1)), w = Math.max(x1 - x0, 3);
+        o.push(`<rect class="ahj-act${sel}" data-uid="${it.uid}" x="${x0}" y="${r.y + 5}" width="${w}" height="${RH - 10}" rx="3" fill="${col}">${tip}</rect>`);
+        const chars = Math.floor((w - 10) / 6.4);
+        if (chars >= 4) o.push(`<text x="${x0 + 6}" y="${yc}" dy=".35em" font-size="11" fill="#fff" pointer-events="none">${esc(trunc(it.title, chars))}</text>`);
+        else if (x1 + 120 < W) o.push(`<text x="${x0 + w + 5}" y="${yc}" dy=".35em" font-size="11" fill="#5d6b7a" pointer-events="none">${esc(trunc(it.title, 22))}</text>`);
+        pos[it.uid] = { xs: x0, xe: x0 + w, y: yc };
+      }
+    });
+    if (S.showDeps) rows.forEach((r) => {
+      if (!r.it) return;
+      r.it.preds.forEach((pu) => {
+        const A = pos[pu], B = pos[r.it.uid];
+        if (!A || !B) return;
+        const hl = S.selected && (S.selected === pu || S.selected === r.it.uid);
+        let d;
+        if (B.xs - A.xe >= 14) d = `M${A.xe},${A.y} H${A.xe + 8} V${B.y} H${B.xs - 1}`;
+        else { const ym = B.y + (B.y > A.y ? -RH / 2 : RH / 2); d = `M${A.xe},${A.y} H${A.xe + 8} V${ym} H${B.xs - 10} V${B.y} H${B.xs - 1}`; }
+        o.push(`<path d="${d}" fill="none" stroke="${hl ? '#111' : '#55606c'}" stroke-width="${hl ? 2 : 1.1}"${hl ? '' : ' stroke-opacity=".75"'} marker-end="url(#ahjA${id}${hl ? 'h' : ''})" pointer-events="none"/>`);
+      });
+    });
+    const t = todayDn();
+    if (t >= p.p0 && t < p.p1) o.push(`<line x1="${X(t + 0.5)}" x2="${X(t + 0.5)}" y1="24" y2="${H}" stroke="#c62828" stroke-width="1.6" pointer-events="none"/>`);
+    o.push('</svg>');
+    el.innerHTML = `<div class="ahj-gantt">${o.join('')}</div>`;
+  }
+
+  // ===== [12] JS: Detaljer, redigering og hendelser =====
+  const modal = $q('#ahj-modal'), dialog = $q('#ahj-dialog');
+  function showModal(html) { dialog.innerHTML = html; modal.hidden = false; const f = dialog.querySelector('input,button'); if (f) f.focus(); }
+  function closeModal() { modal.hidden = true; dialog.innerHTML = ''; S.selected = null; render(); }
+
+  function openDetails(uid) {
+    const it = S.byUid[uid];
+    if (!it) return;
+    S.selected = uid;
+    const c = cal(it.cal), L = S.layers[it.cal], dur = it.end - it.start + 1;
+    const link = (u) => { const x = S.byUid[u]; return `<li><button type="button" class="ahj-link" data-uid="${u}"><span class="ahj-sw" style="background:${cal(x.cal).color}"></span>${esc(x.title)} <span class="ahj-muted">(${fmtRange(x.start, x.end)})</span></button></li>`; };
+    showModal(`<div class="ahj-dlg-bar" style="background:${c.color}"></div><div class="ahj-dlg-body">
+      <h2>${esc(it.title)}</h2>
+      <dl class="ahj-dl"><dt>Kalender</dt><dd>${esc(c.title)} <span class="ahj-muted">(eier: ${esc(c.owner)})</span></dd>
+      <dt>Periode</dt><dd>${fmtRange(it.start, it.end)} <span class="ahj-muted">(${dur} ${dur === 1 ? 'dag' : 'dager'}, uke ${isoWeek(it.start)}${isoWeek(it.end) !== isoWeek(it.start) ? '–' + isoWeek(it.end) : ''})</span></dd>
+      <dt>Ansvarlig</dt><dd>${esc(it.responsible || '–')}</dd><dt>Status</dt><dd>${esc(statusOf(it))}</dd>
+      ${it.description ? `<dt>Beskrivelse</dt><dd>${esc(it.description)}</dd>` : ''}</dl>
+      ${it.preds.length ? `<h3>Avhenger av</h3><ul>${it.preds.map(link).join('')}</ul>` : ''}
+      ${it.succs.length ? `<h3>Etterfølgende aktiviteter</h3><ul>${it.succs.map(link).join('')}</ul>` : ''}
+      ${L.canEdit ? '' : '<p class="ahj-muted" style="margin-top:14px">Du har lesetilgang til denne kalenderen.</p>'}
+    </div><div class="ahj-dlg-foot">
+      ${L.canEdit ? '<button type="button" class="ahj-btn ahj-primary" data-act="edit">Rediger</button>' : ''}
+      ${C.mode === 'sp' ? '<button type="button" class="ahj-btn" data-act="open">Åpne i SharePoint</button>' : ''}
+      <button type="button" class="ahj-btn" data-act="close">Lukk</button></div>`);
+    render();
+  }
+
+  function openNewChooser() {
+    const cs = C.calendars.filter((c) => S.layers[c.key].canAdd && S.layers[c.key].available);
+    if (cs.length === 1) return startNew(cs[0].key);
+    showModal(`<div class="ahj-dlg-body"><h2>Ny aktivitet</h2><p class="ahj-muted">Velg kalender. Bare kalendere du har skrivetilgang til vises.</p>
+      <div class="ahj-choose">${cs.map((c) => `<button type="button" class="ahj-btn" data-new="${c.key}"><span class="ahj-sw" style="background:${c.color}"></span>${esc(c.title)} <span class="ahj-muted">· ${esc(c.owner)}</span></button>`).join('')}</div>
+      </div><div class="ahj-dlg-foot"><button type="button" class="ahj-btn" data-act="close">Avbryt</button></div>`);
+  }
+  function startNew(key) {
+    if (C.mode === 'sp') { closeModal(); openSpForm('new', key); }
+    else { S.selected = null; openEditForm(null, key); }
+  }
+
+  // Demo-skjema (i SP-modus brukes listens egne skjema)
+  function openEditForm(uid, key) {
+    const it = uid ? S.byUid[uid] : null, k = it ? it.cal : key, c = cal(k), t0 = todayDn();
+    const opts = S.items.filter((x) => !it || x.uid !== it.uid).sort((a, b) => a.start - b.start)
+      .map((x) => `<option value="${x.uid}"${it && it.preds.includes(x.uid) ? ' selected' : ''}>${esc(cal(x.cal).title)}: ${esc(x.title)} (${fmtShort(x.start)})</option>`).join('');
+    const stOpts = ['', 'Planlagt', 'Pågår', 'Fullført', 'Utsatt'].map((s) => `<option value="${s}"${it && it.status === s ? ' selected' : ''}>${s || 'Automatisk (fra datoer)'}</option>`).join('');
+    showModal(`<form id="ahj-form" novalidate><div class="ahj-dlg-bar" style="background:${c.color}"></div><div class="ahj-dlg-body">
+      <h2>${it ? 'Rediger aktivitet' : 'Ny aktivitet'}</h2>
+      <p class="ahj-muted" style="margin-top:0">Kalender: ${esc(c.title)}. Demomodus – endringer gjelder til siden lastes på nytt.</p>
+      <div class="ahj-form-grid">
+        <label class="ahj-wide">Tittel<input name="title" value="${esc(it ? it.title : '')}"></label>
+        <label>Startdato<input type="date" name="start" value="${dnToIso(it ? it.start : t0)}"></label>
+        <label>Sluttdato<input type="date" name="end" value="${dnToIso(it ? it.end : t0)}"></label>
+        <label>Ansvarlig<input name="responsible" value="${esc(it ? it.responsible : '')}"></label>
+        <label>Status<select name="status">${stOpts}</select></label>
+        <label class="ahj-wide">Avhenger av (Ctrl/Cmd-klikk for flere)<select name="preds" multiple size="6">${opts}</select></label>
+        <label class="ahj-wide">Beskrivelse<textarea name="description" rows="3">${esc(it ? it.description : '')}</textarea></label>
+      </div><p class="ahj-err" id="ahj-form-err"></p>
+      <input type="hidden" name="uid" value="${it ? it.uid : ''}"><input type="hidden" name="cal" value="${k}">
+    </div><div class="ahj-dlg-foot">
+      ${it ? '<button type="button" class="ahj-btn ahj-danger" data-act="delete">Slett</button>' : ''}
+      <button type="submit" class="ahj-btn ahj-primary">Lagre</button><button type="button" class="ahj-btn" data-act="close">Avbryt</button>
+    </div></form>`);
+  }
+
+  function action(a) {
+    const it = S.byUid[S.selected];
+    if (a === 'close') closeModal();
+    else if (a === 'new') openNewChooser();
+    else if (a === 'edit' && it) { if (C.mode === 'sp') { closeModal(); openSpForm('edit', it.cal, it.id); } else openEditForm(it.uid); }
+    else if (a === 'open' && it) { closeModal(); openSpForm('disp', it.cal, it.id); }
+    else if (a === 'delete' && it) {
+      S.items = S.items.filter((x) => x.uid !== it.uid);
+      S.items.forEach((x) => { x.preds = x.preds.filter((u) => u !== it.uid); });
+      buildIndex(); closeModal();
+    }
+  }
+
+  root.addEventListener('click', (ev) => {
+    if (ev.target === modal) { closeModal(); return; }
+    const t = ev.target.closest('[data-view],[data-scale],[data-nav],[data-wheelmode],[data-act],[data-uid],[data-month],[data-new]');
+    if (!t) return;
+    const d = t.dataset;
+    if (d.view) { S.view = d.view; render(); }
+    else if (d.scale) { S.scale = d.scale; render(); }
+    else if (d.nav !== undefined) { if (+d.nav === 0) S.anchor = todayDn(); else shift(+d.nav); render(); }
+    else if (d.wheelmode) { S.wheelMode = d.wheelmode; render(); }
+    else if (d.month !== undefined) { S.scale = 'month'; S.anchor = +d.month; render(); }
+    else if (d.new) startNew(d.new);
+    else if (d.uid) openDetails(d.uid);
+    else if (d.act) action(d.act);
+  });
+  root.addEventListener('change', (ev) => {
+    const t = ev.target;
+    if (t.dataset && t.dataset.layer) { S.layers[t.dataset.layer].visible = t.checked; render(); }
+    else if (t.id === 'ahj-deps') { S.showDeps = t.checked; render(); }
+  });
+  let searchTimer;
+  root.addEventListener('input', (ev) => {
+    if (ev.target.id !== 'ahj-search') return;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { S.search = ev.target.value; render(); }, 200);
+  });
+  root.addEventListener('submit', (ev) => {
+    if (ev.target.id !== 'ahj-form') return;
+    ev.preventDefault();
+    const E = ev.target.elements, err = $q('#ahj-form-err');
+    const title = E['title'].value.trim();
+    if (!title) { err.textContent = 'Tittel må fylles ut.'; return; }
+    if (!E['start'].value || !E['end'].value) { err.textContent = 'Start- og sluttdato må fylles ut.'; return; }
+    const s = isoToDn(E['start'].value), e = isoToDn(E['end'].value);
+    if (e < s) { err.textContent = 'Sluttdato kan ikke være før startdato.'; return; }
+    const data = { title, start: s, end: e, responsible: E['responsible'].value.trim(), status: E['status'].value,
+      description: E['description'].value.trim(), preds: Array.from(E['preds'].selectedOptions).map((o) => o.value) };
+    if (E['uid'].value) Object.assign(S.byUid[E['uid'].value], data);
+    else {
+      const k = E['cal'].value, id = Math.max(0, ...S.items.filter((x) => x.cal === k).map((x) => x.id)) + 1;
+      S.items.push(Object.assign({ uid: k + ':' + id, cal: k, id }, data));
+      S.anchor = s;
+    }
+    buildIndex(); closeModal();
+  });
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && !modal.hidden) closeModal(); });
+  let resizeTimer;
+  window.addEventListener('resize', () => { if (S.view !== 'gantt') return; clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
+
+  // ===== [13] JS: Oppstart =====
+  async function load() {
+    S.loading = true; S.error = null; render();
+    try {
+      if (C.mode === 'sp') {
+        await ensureJQuery();
+        const res = await Promise.all(C.calendars.map(loadCalendarSP));
+        S.items = [].concat(...res);
+      } else {
+        C.calendars.forEach((c) => {
+          const perm = (C.demoPermissions || {})[c.key] || 'edit';
+          Object.assign(S.layers[c.key], { available: true, canEdit: perm === 'edit', canAdd: perm === 'edit' });
+        });
+        if (!S.demoLoaded) { S.items = demoItems(); S.demoLoaded = true; }
+      }
+      buildIndex();
+    } catch (e) { S.error = e.message || String(e); }
+    S.loading = false;
+    render();
+  }
+  $q('#ahj-title').textContent = C.appTitle;
+  $q('#ahj-org').textContent = C.orgName;
+  if (C.mode === 'demo') { const b = $q('#ahj-banner'); b.hidden = false; b.textContent = 'Demomodus – fiktive data'; }
+  load();
+})();
+</script>
+</body>
+</html>
